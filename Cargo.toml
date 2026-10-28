@@ -1,0 +1,28 @@
+[package]
+name = "settings-dialog"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Network, Bluetooth, sound and screen settings, built on fastframe and egui"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = { version = "0.36.2", features = ["default_fonts"] }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+log = "0.4"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# Unoptimized font, SVG and egui code takes a second for the first frame of
+# every new screen; our own code stays quick to build and debug.
+[profile.dev.package."*"]
+opt-level = 2
