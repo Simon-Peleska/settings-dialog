@@ -550,14 +550,6 @@ fn ip(
     entry(ui, form, "Gateway", &mut ip.gateway);
     entry(ui, form, "DNS servers", &mut ip.dns);
     entry(ui, form, "Search domains", &mut ip.search);
-    ui.horizontal(|ui| {
-        ui.add_space(LABEL + ui.spacing().item_spacing.x);
-        ui.label(
-            RichText::new("Separate several with commas; addresses as 192.168.1.5/24.")
-                .color(pal.dim)
-                .small(),
-        );
-    });
     let family = if id == "ipv4" { "IPv4" } else { "IPv6" };
     for (key, label, value) in [
         (

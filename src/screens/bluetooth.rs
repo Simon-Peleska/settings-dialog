@@ -415,21 +415,11 @@ fn details(
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.add_space(LABEL + ui.spacing().item_spacing.x);
-                        trust = form.check(
-                            ui,
-                            "bt-trust",
-                            "Trusted: reconnects by itself",
-                            &mut trusted,
-                        );
+                        trust = form.check(ui, "bt-trust", "Trusted", &mut trusted);
                     });
                     ui.horizontal(|ui| {
                         ui.add_space(LABEL + ui.spacing().item_spacing.x);
-                        block = form.check(
-                            ui,
-                            "bt-block",
-                            "Blocked: refuse all connections",
-                            &mut blocked,
-                        );
+                        block = form.check(ui, "bt-block", "Blocked", &mut blocked);
                     });
                 }
                 if !device.uuids.is_empty() {

@@ -4,6 +4,7 @@ mod finder;
 mod form;
 mod hypr;
 mod lan;
+mod light;
 mod nix;
 mod nm;
 mod pw;

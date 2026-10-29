@@ -12,7 +12,8 @@ const FILES: [&str; 3] = ["sound.nix", "bluetooth.nix", "network.nix"];
 const HEADER: &str = "# Written by settings-dialog. Edits here are overwritten.\n";
 
 pub fn dir() -> PathBuf {
-    std::env::var_os("SETTINGS_DIALOG_NIX_DIR").map_or_else(|| Path::new(DIR).join(OURS), PathBuf::from)
+    std::env::var_os("SETTINGS_DIALOG_NIX_DIR")
+        .map_or_else(|| Path::new(DIR).join(OURS), PathBuf::from)
 }
 
 /// Whether the NixOS config imports the directory, without which a written

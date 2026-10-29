@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use serde_json::Value;
 
+use crate::light::{self, Backlight};
 use crate::nm::{failed, run};
 use crate::tablet;
 
@@ -110,6 +111,10 @@ pub struct Snapshot {
     pub path: PathBuf,
     /// hyprland.lua loads the layout file, so saving sticks across a restart.
     pub imported: bool,
+    /// The panels whose brightness can be set, one per backlight in sysfs.
+    pub lights: Vec<Backlight>,
+    /// Whether there is an ambient light sensor to follow.
+    pub sensor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -121,11 +126,18 @@ pub enum Request {
     Attention,
     /// Applies the layout now and writes it to the layout file.
     Save(Vec<Monitor>),
+    /// Sets one panel's backlight, 0 to 1.
+    Brightness {
+        device: String,
+        level: f32,
+    },
 }
 
 pub enum Reply {
     Snapshot(Result<Snapshot, String>),
     Done(Result<(), String>),
+    /// A brightness that could not be set; it leaves the layout alone.
+    Light(Result<(), String>),
 }
 
 pub struct Backend {
@@ -181,6 +193,7 @@ fn handle(request: Request) -> Option<Reply> {
                 apply(&monitors).and_then(|()| write(&monitors)),
             ))
         }
+        Request::Brightness { device, level } => Some(Reply::Light(light::set(&device, level))),
         // A failure here only means the window stays where it is, which is no
         // reason to take the layout error line away from the page.
         Request::Attention => {
@@ -247,10 +260,14 @@ fn snapshot() -> Result<Snapshot, String> {
         std::fs::read_to_string(dir.join("hyprland.lua"))
             .is_ok_and(|config| config.contains(LAYOUT_FILE))
     });
+    let lights = light::backlights();
+    let sensor = light::lux().is_some();
     Ok(Snapshot {
         monitors,
         path: path.unwrap_or_default(),
         imported,
+        lights,
+        sensor,
     })
 }
 

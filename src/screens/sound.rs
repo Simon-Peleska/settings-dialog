@@ -313,20 +313,10 @@ fn details(
                 + (buttons - 1.0).max(0.0) * ui.spacing().item_spacing.x;
             ui.add_space((ui.available_width() - width).max(0.0));
             if !current {
-                use_now = form.icon_button(
-                    ui,
-                    "sound-now",
-                    Icon::Speaker,
-                    "Use now, until a device is added or removed",
-                );
+                use_now = form.icon_button(ui, "sound-now", Icon::Speaker, "Use now");
             }
             if !default {
-                make = form.icon_button(
-                    ui,
-                    "sound-default",
-                    Icon::Star,
-                    "Make default: saved, and used now",
-                );
+                make = form.icon_button(ui, "sound-default", Icon::Star, "Make default");
             }
         });
     });

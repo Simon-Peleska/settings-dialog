@@ -5,6 +5,7 @@ use egui::{Frame, Margin, Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, po
 use super::{Action, Cx};
 use crate::form::{self, Form, Icon, Press, Row};
 use crate::hypr::{Mode, Monitor, Request, Snapshot};
+use crate::light::{self, Auto, Backlight};
 use crate::tablet::{self, Tablet};
 use crate::theme::Palette;
 
@@ -50,6 +51,8 @@ pub struct Displays {
     refreshed: Option<Instant>,
     /// A layout applied live and waiting to be kept.
     confirm: Option<Confirm>,
+    /// Follows the ambient light sensor while it is here; dropping it stops.
+    auto: Option<Auto>,
     /// Streamed by Sunshine while it is here; dropping it removes the output.
     tablet: Option<Tablet>,
     /// Selects the tablet's output once a snapshot has it.
@@ -60,6 +63,15 @@ struct Confirm {
     until: Instant,
     /// The layout to go back to when it isn't kept.
     previous: Vec<Monitor>,
+}
+
+/// The brightness of the screen being shown, and what the pane did with it.
+struct Light<'a> {
+    found: &'a [Backlight],
+    sensor: bool,
+    auto: bool,
+    /// The backlight to set, and the level it was dragged to.
+    set: Option<(String, f32)>,
 }
 
 struct Line {
@@ -81,6 +93,7 @@ impl Displays {
             error: None,
             refreshed: None,
             confirm: None,
+            auto: None,
             tablet: None,
             find_tablet: false,
         }
@@ -122,6 +135,14 @@ impl Displays {
         }
     }
 
+    /// A brightness that would not be set; the layout is none the worse, so
+    /// a working one stays applied and only the line appears.
+    pub fn light(&mut self, result: Result<(), String>) {
+        if let Err(err) = result {
+            self.error = Some(err);
+        }
+    }
+
     pub fn show(&mut self, cx: &mut Cx<'_>, form: &mut Form<'_>, rect: Rect) -> Option<Action> {
         if self.refreshed.is_none_or(|at| at.elapsed() >= REFRESH) {
             self.refreshed = Some(Instant::now());
@@ -158,6 +179,20 @@ impl Displays {
         let saved = match &self.snap {
             Some(Ok(snap)) => (snap.imported, snap.path.display().to_string()),
             _ => (true, String::new()),
+        };
+        if let Some(err) = self.auto.as_ref().and_then(Auto::error) {
+            self.error = Some(err);
+            self.auto = None;
+        }
+        let (lights, sensor) = match &self.snap {
+            Some(Ok(snap)) => (snap.lights.clone(), snap.sensor),
+            _ => (Vec::new(), false),
+        };
+        let mut light = Light {
+            found: &lights,
+            sensor,
+            auto: self.auto.is_some(),
+            set: None,
         };
         let lines = lines(&self.draft);
         let rows: Vec<Row<'_>> = lines
@@ -213,7 +248,7 @@ impl Displays {
                         ui.set_max_width(inner.x);
                         let shown = read_error.as_deref().or(error.as_deref());
                         (reset, save) = pane_contents(
-                            ui, form, draft, selected, changed, &saved, shown, tablet,
+                            ui, form, draft, selected, changed, &saved, shown, tablet, &mut light,
                         );
                     });
             });
@@ -222,6 +257,21 @@ impl Displays {
             self.selected = index;
         } else if let Some(line) = lines.get(index).filter(|line| line.header.is_none()) {
             self.selected = line.monitor;
+        }
+        if let Some((device, level)) = light.set {
+            cx.screens.push(Request::Brightness { device, level });
+        }
+        if light.auto != self.auto.is_some() {
+            self.auto = match light.auto {
+                true => self
+                    .draft
+                    .get(self.selected)
+                    .and_then(|monitor| light::of(&lights, &monitor.name))
+                    .map(|backlight| {
+                        Auto::start(cx.ctx.clone(), backlight.device.clone(), backlight.level)
+                    }),
+                false => None,
+            };
         }
         if press == Some(Press::Toggle)
             && let Some(monitor) = self.draft.get_mut(self.selected)
@@ -366,6 +416,7 @@ fn pane_contents(
     saved: &(bool, String),
     error: Option<&str>,
     tablet: Option<&mut Tablet>,
+    light: &mut Light<'_>,
 ) -> (bool, bool) {
     let pal = form.pal().clone();
     let label = draft
@@ -441,7 +492,7 @@ fn pane_contents(
                     ui.add_space(4.0);
                 }
                 let before = draft.get(*selected).map(Monitor::logical);
-                fields(ui, form, draft, *selected);
+                fields(ui, form, draft, *selected, light);
                 if draft.get(*selected).map(Monitor::logical) != before {
                     settle(draft, *selected);
                 }
@@ -646,7 +697,13 @@ fn overlap(one: (f32, f32, f32, f32), two: (f32, f32, f32, f32)) -> bool {
     one.0 < two.0 + two.2 && two.0 < one.0 + one.2 && one.1 < two.1 + two.3 && two.1 < one.1 + one.3
 }
 
-fn fields(ui: &mut Ui, form: &mut Form<'_>, draft: &mut [Monitor], selected: usize) {
+fn fields(
+    ui: &mut Ui,
+    form: &mut Form<'_>,
+    draft: &mut [Monitor],
+    selected: usize,
+    light: &mut Light<'_>,
+) {
     let pal = form.pal().clone();
     let names: Vec<String> = draft
         .iter()
@@ -750,15 +807,42 @@ fn fields(ui: &mut Ui, form: &mut Form<'_>, draft: &mut [Monitor], selected: usi
     });
     let mut flipped = monitor.transform >= 4;
     field(ui, &pal, "Flipped", |ui| {
-        form.check(ui, "displays-flip", "Mirror the picture", &mut flipped)
+        form.check(ui, "displays-flip", "", &mut flipped)
     });
     monitor.transform = ROTATIONS[index].1 + 4 * u8::from(flipped);
 
     let mut vrr = monitor.vrr;
     field(ui, &pal, "Variable refresh", |ui| {
-        form.check(ui, "displays-vrr", "Follow what is drawn", &mut vrr)
+        form.check(ui, "displays-vrr", "", &mut vrr)
     });
     monitor.vrr = vrr;
+
+    if let Some(backlight) = light::of(light.found, &monitor.name) {
+        if light.auto {
+            row(
+                ui,
+                &pal,
+                "Brightness",
+                &format!("{:.0} %", backlight.level * 100.0),
+            );
+        } else {
+            let mut level = backlight.level;
+            ui.horizontal(|ui| {
+                form::label(ui, &pal, "Brightness", LABEL);
+                if form.slider(ui, "displays-brightness", &mut level, FIELD) {
+                    light.set = Some((backlight.device.clone(), level));
+                }
+                ui.label(RichText::new(format!("{:.0} %", level * 100.0)).color(pal.text));
+            });
+        }
+        if light.sensor {
+            let mut auto = light.auto;
+            field(ui, &pal, "Automatic brightness", |ui| {
+                form.check(ui, "displays-auto", "", &mut auto)
+            });
+            light.auto = auto;
+        }
+    }
 
     let mut options = vec!["Nothing".to_owned()];
     options.extend(names);
