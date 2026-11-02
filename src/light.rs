@@ -2,9 +2,7 @@
 //! that have nothing to do with Hyprland, so the Screens page reads them here.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use crate::nm::{failed, run};
@@ -42,13 +40,13 @@ pub fn backlights() -> Vec<Backlight> {
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         let max = number(&path.join("max_brightness")).unwrap_or(0.0);
-        // The level that was asked for; what the panel shows reads as 0 while
-        // the driver is in the middle of a modeset.
-        let now = number(&path.join("brightness")).unwrap_or(0.0);
         if max <= 0.0 {
             log::debug!("{} has no brightness to set", path.display());
             continue;
         }
+        // The level that was asked for; what the panel shows reads as 0 while
+        // the driver is in the middle of a modeset.
+        let now = number(&path.join("brightness")).unwrap_or(0.0);
         let device = entry.file_name().to_string_lossy().into_owned();
         let connector =
             connector_of(&std::fs::canonicalize(path.join("device")).unwrap_or_default());
@@ -115,8 +113,8 @@ pub fn lux() -> Option<f32> {
 /// How bright the panel should be for that much light in the room. The eye
 /// reads light logarithmically, so the level follows the logarithm of the lux,
 /// not the lux: dim in the dark, full from about a thousand lux up.
-pub fn level_for(lux: f32) -> f32 {
-    (0.1 + 0.3 * (1.0 + lux.max(0.0)).log10()).clamp(DIMMEST, 1.0)
+fn level_for(lux: f32) -> f32 {
+    (0.1 + 0.3 * (1.0 + lux.max(0.0)).log10()).min(1.0)
 }
 
 /// "…/drm/card1/card1-eDP-1" is the connector the panel sits on.
@@ -136,23 +134,22 @@ fn number(path: &Path) -> Option<f32> {
 /// is dropped. One thread, like the finder, because nothing else has to wait
 /// for it.
 pub struct Auto {
-    pub device: String,
-    stop: Arc<AtomicBool>,
+    device: String,
+    stop: Sender<()>,
     errors: Receiver<String>,
 }
 
 impl Auto {
     pub fn start(ctx: egui::Context, device: String, level: f32) -> Self {
         let (sender, errors) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let (stop, stopped) = mpsc::channel::<()>();
         let name = device.clone();
         log::info!("following the light in the room for {device}");
         std::thread::Builder::new()
             .name("brightness".into())
             .spawn(move || {
                 let mut level = level;
-                while !stopped.load(Ordering::Relaxed) {
+                loop {
                     let Some(lux) = lux() else {
                         let err = failed(
                             "LT-2",
@@ -174,12 +171,10 @@ impl Auto {
                         level = wanted;
                         ctx.request_repaint();
                     }
-                    // Short naps, so the toggle stops it at once.
-                    for _ in 0..20 {
-                        if stopped.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        std::thread::sleep(STEP / 20);
+                    // Waiting on the channel, so dropping Auto stops it at once.
+                    match stopped.recv_timeout(STEP) {
+                        Err(RecvTimeoutError::Timeout) => {}
+                        _ => return,
                     }
                 }
             })
@@ -193,7 +188,7 @@ impl Auto {
 
     /// The error that stopped the thread, once.
     pub fn error(&self) -> Option<String> {
-        self.errors.try_iter().last()
+        self.errors.try_recv().ok()
     }
 }
 
@@ -203,7 +198,7 @@ impl Drop for Auto {
             "no longer following the light in the room for {}",
             self.device
         );
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.stop.send(());
     }
 }
 

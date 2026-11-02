@@ -13,6 +13,9 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// How long an applied layout waits to be kept before it goes back, so a
 /// screen that went dark can't lock the desktop out.
 const CONFIRM: Duration = Duration::from_secs(10);
+/// How long a brightness just set wins over the snapshot, which lags behind
+/// it; without that the slider springs back to the old level mid-drag.
+const SETTLE: Duration = Duration::from_secs(1);
 const PANE_WIDTH: f32 = 600.0;
 const GAP: f32 = 20.0;
 const LABEL: f32 = 170.0;
@@ -51,6 +54,10 @@ pub struct Displays {
     refreshed: Option<Instant>,
     /// A layout applied live and waiting to be kept.
     confirm: Option<Confirm>,
+    /// The brightness just sent, which wins over the snapshot for SETTLE.
+    brightness: Option<(String, f32, Instant)>,
+    /// A brightness that would not be set, shown by the slider.
+    light_error: Option<String>,
     /// Follows the ambient light sensor while it is here; dropping it stops.
     auto: Option<Auto>,
     /// Streamed by Sunshine while it is here; dropping it removes the output.
@@ -67,11 +74,16 @@ struct Confirm {
 
 /// The brightness of the screen being shown, and what the pane did with it.
 struct Light<'a> {
-    found: &'a [Backlight],
+    /// The backlight of that screen, if it has one; without one no brightness
+    /// is shown at all.
+    backlight: Option<&'a Backlight>,
+    /// Its level, 0 to 1, the one just sent while that is the fresher of the two.
+    level: f32,
+    error: Option<&'a str>,
     sensor: bool,
     auto: bool,
-    /// The backlight to set, and the level it was dragged to.
-    set: Option<(String, f32)>,
+    /// The level the slider was dragged to.
+    set: Option<f32>,
 }
 
 struct Line {
@@ -93,6 +105,8 @@ impl Displays {
             error: None,
             refreshed: None,
             confirm: None,
+            brightness: None,
+            light_error: None,
             auto: None,
             tablet: None,
             find_tablet: false,
@@ -136,11 +150,9 @@ impl Displays {
     }
 
     /// A brightness that would not be set; the layout is none the worse, so
-    /// a working one stays applied and only the line appears.
-    pub fn light(&mut self, result: Result<(), String>) {
-        if let Err(err) = result {
-            self.error = Some(err);
-        }
+    /// a working one stays applied and only the line by the slider appears.
+    pub fn light(&mut self, err: String) {
+        self.light_error = Some(err);
     }
 
     pub fn show(&mut self, cx: &mut Cx<'_>, form: &mut Form<'_>, rect: Rect) -> Option<Action> {
@@ -181,15 +193,28 @@ impl Displays {
             _ => (true, String::new()),
         };
         if let Some(err) = self.auto.as_ref().and_then(Auto::error) {
-            self.error = Some(err);
+            self.light_error = Some(err);
             self.auto = None;
         }
-        let (lights, sensor) = match &self.snap {
-            Some(Ok(snap)) => (snap.lights.clone(), snap.sensor),
-            _ => (Vec::new(), false),
+        let name = self
+            .draft
+            .get(self.selected)
+            .map_or("", |monitor| monitor.name.as_str());
+        let (backlight, sensor) = match &self.snap {
+            Some(Ok(snap)) => (light::of(&snap.lights, name), snap.sensor),
+            _ => (None, false),
         };
+        let just_set = self
+            .brightness
+            .as_ref()
+            .filter(|(device, _, at)| {
+                at.elapsed() < SETTLE && backlight.is_some_and(|light| *device == light.device)
+            })
+            .map(|(_, level, _)| *level);
         let mut light = Light {
-            found: &lights,
+            backlight,
+            level: just_set.unwrap_or(backlight.map_or(0.0, |light| light.level)),
+            error: self.light_error.as_deref(),
             sensor,
             auto: self.auto.is_some(),
             set: None,
@@ -258,19 +283,28 @@ impl Displays {
         } else if let Some(line) = lines.get(index).filter(|line| line.header.is_none()) {
             self.selected = line.monitor;
         }
-        if let Some((device, level)) = light.set {
-            cx.screens.push(Request::Brightness { device, level });
+        let (dragged, shown, auto) = (light.set, light.level, light.auto);
+        // brightnessctl only takes whole percent, and the slider reports a
+        // change on every frame the button is down, however far it moved.
+        if let (Some(level), Some(backlight)) = (dragged, backlight)
+            && (level * 100.0).round() != (shown * 100.0).round()
+        {
+            cx.screens.push(Request::Brightness {
+                device: backlight.device.clone(),
+                level,
+            });
+            self.brightness = Some((backlight.device.clone(), level, Instant::now()));
+            self.light_error = None;
+            cx.ctx.request_repaint_after(SETTLE);
         }
-        if light.auto != self.auto.is_some() {
-            self.auto = match light.auto {
-                true => self
-                    .draft
-                    .get(self.selected)
-                    .and_then(|monitor| light::of(&lights, &monitor.name))
-                    .map(|backlight| {
-                        Auto::start(cx.ctx.clone(), backlight.device.clone(), backlight.level)
-                    }),
-                false => None,
+        if auto != self.auto.is_some() {
+            self.auto = match (auto, backlight) {
+                (true, Some(backlight)) => Some(Auto::start(
+                    cx.ctx.clone(),
+                    backlight.device.clone(),
+                    backlight.level,
+                )),
+                _ => None,
             };
         }
         if press == Some(Press::Toggle)
@@ -817,20 +851,22 @@ fn fields(
     });
     monitor.vrr = vrr;
 
-    if let Some(backlight) = light::of(light.found, &monitor.name) {
+    if light.backlight.is_some() {
+        if let Some(error) = light.error {
+            ui.label(RichText::new(error).color(pal.danger));
+        }
         if light.auto {
             row(
                 ui,
                 &pal,
                 "Brightness",
-                &format!("{:.0} %", backlight.level * 100.0),
+                &format!("{:.0} %", light.level * 100.0),
             );
         } else {
-            let mut level = backlight.level;
-            ui.horizontal(|ui| {
-                form::label(ui, &pal, "Brightness", LABEL);
+            let mut level = light.level;
+            field(ui, &pal, "Brightness", |ui| {
                 if form.slider(ui, "displays-brightness", &mut level, FIELD) {
-                    light.set = Some((backlight.device.clone(), level));
+                    light.set = Some(level);
                 }
                 ui.label(RichText::new(format!("{:.0} %", level * 100.0)).color(pal.text));
             });

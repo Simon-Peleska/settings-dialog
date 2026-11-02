@@ -1062,6 +1062,23 @@ pub fn station_signal(device: &str, mac: &str) -> Result<Option<Signal>, String>
     }))
 }
 
+/// Every MAC the radio of this device has a signal for: the devices on our
+/// hotspot when it runs one, or the access point we are on when it is a
+/// client. Empty for a wired device, where no signal can be read at all.
+pub fn station_macs(device: &str) -> Vec<String> {
+    let dump = match run("iw", ["dev", device, "station", "dump"]) {
+        Ok(dump) => dump,
+        Err(err) => {
+            log::debug!("no radio signals on {device}: {err}");
+            return Vec::new();
+        }
+    };
+    parse_station_dump(device, &dump, "")
+        .into_iter()
+        .map(|station| station.mac)
+        .collect()
+}
+
 /// `iw dev <device> link`: the access point, then its properties one tab in.
 fn parse_link(link: &str) -> Vec<(&'static str, String)> {
     let Some(first) = link.lines().next() else {

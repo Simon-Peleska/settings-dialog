@@ -5,7 +5,8 @@ use egui::RichText;
 use super::graph::Graph;
 use super::{Action, Cx, radar};
 use crate::bt;
-use crate::form::{self, Form, FormState};
+use crate::finder::{Finder, Source};
+use crate::form::{self, Form, FormState, Icon};
 use crate::lan;
 use crate::nm::{Beacon, Connection, Request};
 use crate::pw;
@@ -53,6 +54,9 @@ enum OverlayKind {
         title: String,
         device: String,
         scan: lan::Scan,
+        /// Beeping for one of the devices in the list, when the radio has a
+        /// signal for it. Boxed to keep `Action` small.
+        finder: Option<Box<Finder>>,
     },
     Graph {
         snap: Option<Box<Result<pw::Snapshot, String>>>,
@@ -136,6 +140,7 @@ impl Overlay {
                 title,
                 device,
                 scan,
+                finder: None,
             },
         )
     }
@@ -338,9 +343,15 @@ impl Overlay {
                 title,
                 device,
                 scan,
+                finder,
             } => {
                 scan.poll();
+                if let Some(finder) = finder.as_mut() {
+                    finder.poll();
+                }
                 let height = (cx.ctx.content_rect().height() - 240.0).max(160.0);
+                let mut find = None;
+                let mut rescan = false;
                 form::popup(cx.ctx, pal, "devices", title, |ui| {
                     ui.set_min_width(860.0);
                     match &scan.found {
@@ -369,10 +380,16 @@ impl Overlay {
                                     ui.add(egui::Spinner::new().color(pal.accent));
                                 }
                             });
+                            if let Some(err) = finder.as_ref().and_then(|f| f.error.as_deref()) {
+                                ui.label(RichText::new(err).color(pal.danger));
+                            }
                             ui.add_space(6.0);
-                            egui::ScrollArea::vertical()
+                            find = egui::ScrollArea::vertical()
                                 .max_height(height)
-                                .show(ui, |ui| hosts(ui, pal, &found.hosts));
+                                .show(ui, |ui| {
+                                    hosts(ui, &mut form, pal, &found.hosts, finder.as_deref())
+                                })
+                                .inner;
                         }
                     }
                     ui.add_space(12.0);
@@ -381,11 +398,29 @@ impl Overlay {
                         ui,
                         &[("rescan", "Scan again"), ("close", "Close")],
                     ) {
-                        Some(0) => *scan = lan::Scan::start(cx.ctx.clone(), device.clone()),
+                        Some(0) => rescan = true,
                         Some(_) => action = Some(Action::Pop),
                         None => {}
                     }
                 });
+                if let Some((mac, ip)) = find {
+                    *finder = match finder.as_ref().filter(|f| f.key == mac) {
+                        Some(_) => None,
+                        None => {
+                            log::info!("finding device {mac} on {device} by sound");
+                            let source = Source::Station {
+                                device: device.clone(),
+                                mac: mac.clone(),
+                                ip,
+                            };
+                            Some(Box::new(Finder::start(cx.ctx.clone(), mac, source)))
+                        }
+                    };
+                }
+                if rescan {
+                    *scan = lan::Scan::start(cx.ctx.clone(), device.clone());
+                    *finder = None;
+                }
             }
             OverlayKind::Graph {
                 snap,
@@ -472,14 +507,29 @@ impl Overlay {
 
 /// One row per device: name with its role, addresses (IPv6 dimmed under the
 /// IPv4 one), MAC, manufacturer and ping.
-fn hosts(ui: &mut egui::Ui, pal: &crate::theme::Palette, hosts: &[lan::Host]) {
+/// The MAC and IPv4 address of the device whose find button was pressed.
+fn hosts(
+    ui: &mut egui::Ui,
+    form: &mut Form<'_>,
+    pal: &crate::theme::Palette,
+    hosts: &[lan::Host],
+    finding: Option<&Finder>,
+) -> Option<(String, String)> {
+    let mut find = None;
     egui::Grid::new("lan_hosts")
-        .num_columns(5)
+        .num_columns(6)
         .spacing(egui::vec2(20.0, 8.0))
         .striped(false)
         .show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            for heading in ["Name", "Address", "MAC address", "Manufacturer", "Ping"] {
+            for heading in [
+                "Name",
+                "Address",
+                "MAC address",
+                "Manufacturer",
+                "Ping",
+                "Signal",
+            ] {
                 ui.label(RichText::new(heading).color(pal.dim));
             }
             ui.end_row();
@@ -523,7 +573,24 @@ fn hosts(ui: &mut egui::Ui, pal: &crate::theme::Palette, hosts: &[lan::Host]) {
                     Some(ms) => ui.label(format!("{ms:.0} ms")),
                     None => ui.label(""),
                 };
+                ui.horizontal(|ui| {
+                    if !host.radio {
+                        return;
+                    }
+                    let found = finding.filter(|finder| finder.key == host.mac);
+                    let (icon, tip) = match found {
+                        Some(_) => (Icon::Stop, "Stop the sound"),
+                        None => (Icon::Find, "Find by sound"),
+                    };
+                    if form.icon_button(ui, &format!("find-{}", host.mac), icon, tip) {
+                        find = Some((host.mac.clone(), host.ipv4.clone()));
+                    }
+                    if let Some(finder) = found {
+                        ui.label(RichText::new(finder.text()).color(pal.text));
+                    }
+                });
                 ui.end_row();
             }
         });
+    find
 }

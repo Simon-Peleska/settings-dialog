@@ -29,6 +29,9 @@ pub struct Host {
     pub ping: Option<f32>,
     pub router: bool,
     pub me: bool,
+    /// Whether the radio has a signal for this device, so it can be found by
+    /// sound: it is on our hotspot, or it is the access point we are on.
+    pub radio: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +96,8 @@ fn scan(device: &str, send: impl Fn(Result<Found, String>)) {
         }
     };
 
+    let heard = crate::nm::station_macs(device);
+
     let mut subnet = String::new();
     if let Some((ip, prefix)) = parse_ipv4(&addr) {
         let (network, prefix) = net(ip, prefix);
@@ -141,6 +146,7 @@ fn scan(device: &str, send: impl Fn(Result<Found, String>)) {
                     None => {
                         hosts.push(Host {
                             vendor: vendor(&vendors, &fresh.mac),
+                            radio: heard.iter().any(|mac| mac.eq_ignore_ascii_case(&fresh.mac)),
                             ..fresh
                         });
                         hosts.last_mut().unwrap()

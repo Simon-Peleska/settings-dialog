@@ -136,8 +136,9 @@ pub enum Request {
 pub enum Reply {
     Snapshot(Result<Snapshot, String>),
     Done(Result<(), String>),
-    /// A brightness that could not be set; it leaves the layout alone.
-    Light(Result<(), String>),
+    /// A brightness that could not be set; it leaves the layout alone. A
+    /// brightness that worked says nothing, the next snapshot shows it.
+    Light(String),
 }
 
 pub struct Backend {
@@ -193,7 +194,7 @@ fn handle(request: Request) -> Option<Reply> {
                 apply(&monitors).and_then(|()| write(&monitors)),
             ))
         }
-        Request::Brightness { device, level } => Some(Reply::Light(light::set(&device, level))),
+        Request::Brightness { device, level } => light::set(&device, level).err().map(Reply::Light),
         // A failure here only means the window stays where it is, which is no
         // reason to take the layout error line away from the page.
         Request::Attention => {

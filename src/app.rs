@@ -178,7 +178,7 @@ impl App {
         match reply {
             hypr::Reply::Snapshot(snap) => self.displays.snapshot(snap),
             hypr::Reply::Done(result) => self.displays.done(result),
-            hypr::Reply::Light(result) => self.displays.light(result),
+            hypr::Reply::Light(err) => self.displays.light(err),
         }
     }
 
