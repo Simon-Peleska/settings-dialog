@@ -10,6 +10,7 @@ use crate::screens::displays::Displays;
 use crate::screens::networks::Networks;
 use crate::screens::overlay::Overlay;
 use crate::screens::sound::Sound;
+use crate::screens::tasks::Tasks;
 use crate::screens::{Action, Cx};
 use crate::theme::Palette;
 
@@ -17,18 +18,20 @@ const MENU_WIDTH: f32 = 200.0;
 const GAP: f32 = 20.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub enum Page {
     Network,
     Bluetooth,
     Sound,
     Screens,
+    Tasks,
 }
 
-const PAGES: [(&str, Page); 4] = [
+pub const PAGES: [(&str, Page); 5] = [
     ("Network", Page::Network),
     ("Bluetooth", Page::Bluetooth),
     ("Sound", Page::Sound),
     ("Screens", Page::Screens),
+    ("Tasks", Page::Tasks),
 ];
 
 pub struct App {
@@ -46,14 +49,21 @@ pub struct App {
     bluetooth: Bluetooth,
     sound: Sound,
     displays: Displays,
+    tasks: Tasks,
     overlay: Option<Overlay>,
     keys: Vec<Key>,
     /// Whether a text field had focus last frame, so it keeps its keys.
     entry: bool,
+    /// Pages asked for on the command line, by this launch or a later one.
+    requests: std::sync::mpsc::Receiver<Page>,
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, pal: Palette) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        pal: Palette,
+        requests: std::sync::mpsc::Receiver<Page>,
+    ) -> Self {
         let mut backend = Backend::start(ctx.clone());
         backend.send(Request::Refresh { rescan: false });
         Self {
@@ -70,9 +80,11 @@ impl App {
             bluetooth: Bluetooth::new(),
             sound: Sound::new(),
             displays: Displays::new(),
+            tasks: Tasks::new(ctx),
             overlay: None,
             keys: Vec::new(),
             entry: false,
+            requests,
         }
     }
 
@@ -242,6 +254,15 @@ impl App {
     }
 }
 
+/// The page's name on the command line: its menu label in lower case.
+pub fn page_name(page: Page) -> String {
+    let (label, _) = PAGES
+        .iter()
+        .find(|(_, p)| *p == page)
+        .expect("every page is listed");
+    label.to_lowercase()
+}
+
 impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.keys = form::take_keys(raw_input, self.entry);
@@ -299,6 +320,9 @@ impl eframe::App for App {
                 detail: None,
                 signal: None,
                 switch: None,
+                tree: &[],
+                columns: &[],
+                links: &[],
             })
             .collect();
         let mut index = PAGES
@@ -314,6 +338,14 @@ impl eframe::App for App {
                 vec2(MENU_WIDTH, ui.available_height()),
             )
         });
+        for requested in self.requests.try_iter() {
+            log::info!("page requested: {}", page_name(requested));
+            index = PAGES
+                .iter()
+                .position(|(_, page)| *page == requested)
+                .unwrap_or(index);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         let page = PAGES[index].1;
         if page != self.page {
             log::debug!("page: {}", PAGES[index].0);
@@ -333,6 +365,9 @@ impl eframe::App for App {
             if page == Page::Screens {
                 self.displays.opened();
             }
+            if page == Page::Tasks {
+                self.tasks.opened();
+            }
             self.page = page;
         }
         let action = match self.page {
@@ -340,6 +375,7 @@ impl eframe::App for App {
             Page::Bluetooth => self.bluetooth.show(&mut cx, &mut form, page_rect),
             Page::Sound => self.sound.show(&mut cx, &mut form, page_rect),
             Page::Screens => self.displays.show(&mut cx, &mut form, page_rect),
+            Page::Tasks => self.tasks.show(&mut cx, &mut form, page_rect),
         };
         let escape = form.escape();
         cx.entry = form.finish(&ctx);

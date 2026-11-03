@@ -7,7 +7,7 @@ use super::editor::{Editor, Find};
 use super::overlay::Overlay;
 use super::{Action, Cx};
 use crate::finder::{Finder, Source};
-use crate::form::{self, Form, Icon, Press, Row};
+use crate::form::{self, Form, Icon, Press, Row, Sort, Table};
 use crate::nm::{AccessPoint, Connection, Kind, Request, Settings, Snapshot, Station};
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -16,6 +16,15 @@ const EDITOR_WIDTH: f32 = 600.0;
 const GAP: f32 = 20.0;
 const LABEL: f32 = 170.0;
 const PADDING: i8 = 16;
+const TABLE: Table = Table {
+    name: "Name",
+    columns: &[
+        ("Address", 130.0),
+        ("Down", 80.0),
+        ("Up", 80.0),
+        ("Signal", 60.0),
+    ],
+};
 
 pub struct Networks {
     selected: Option<String>,
@@ -34,6 +43,8 @@ pub struct Networks {
     details_of: Option<String>,
     details: Option<Result<Vec<(&'static str, String)>, String>>,
     finder: Option<Finder>,
+    /// `None` keeps the order of the groups: connected first, strongest first.
+    sort: Option<Sort>,
 }
 
 struct Traffic {
@@ -76,6 +87,7 @@ impl Networks {
             traffic: HashMap::new(),
             details_of: None,
             details: None,
+            sort: None,
             finder: None,
         }
     }
@@ -161,7 +173,7 @@ impl Networks {
             });
         }
 
-        let lines = lines(cx.snap);
+        let mut lines = lines(cx.snap);
         let connected: Vec<&str> = lines.iter().filter_map(|l| l.device.as_deref()).collect();
         self.traffic
             .retain(|device, _| connected.contains(&device.as_str()));
@@ -171,35 +183,54 @@ impl Networks {
         if !connected.is_empty() {
             cx.ctx.request_repaint_after(TRAFFIC);
         }
-        let details: Vec<Option<String>> = lines
+        let ip = |line: &Line| {
+            let device = line.device.as_deref()?;
+            let device = cx.snap.devices.iter().find(|d| d.name == device)?;
+            Some(device.ip.clone())
+        };
+        let traffic = |line: &Line| self.traffic.get(line.device.as_deref()?);
+        if let Some(sort) = self.sort {
+            let speed = |line: &Line, up: bool| {
+                traffic(line).map_or(0.0, |t| if up { t.up } else { t.down })
+            };
+            form::sort_groups(
+                &mut lines,
+                |l| l.header.is_some(),
+                sort,
+                |a, b| match sort.column {
+                    0 => form::by_text(&a.text, &b.text),
+                    1 => ip(a).cmp(&ip(b)),
+                    2 => speed(a, false).total_cmp(&speed(b, false)),
+                    3 => speed(a, true).total_cmp(&speed(b, true)),
+                    _ => a.signal.cmp(&b.signal),
+                },
+            );
+        }
+        let cells: Vec<[String; 4]> = lines
             .iter()
             .map(|line| {
-                let signal = line.signal.map_or(String::new(), |s| format!("{s} %"));
-                let Some(device) = line.device.as_deref() else {
-                    return line.signal.is_some().then_some(signal);
-                };
-                let ip = cx
-                    .snap
-                    .devices
-                    .iter()
-                    .find(|d| d.name == device)
-                    .map_or("", |d| d.ip.as_str());
-                let rates = self.traffic.get(device).map_or(String::new(), |t| {
-                    format!("↓ {}  ↑ {}", rate(t.down), rate(t.up))
-                });
-                Some(format!("{ip}   {rates}   {signal}").trim().to_owned())
+                let traffic = traffic(line);
+                [
+                    ip(line).unwrap_or_default(),
+                    traffic.map_or(String::new(), |t| rate(t.down)),
+                    traffic.map_or(String::new(), |t| rate(t.up)),
+                    line.signal.map_or(String::new(), |s| format!("{s} %")),
+                ]
             })
             .collect();
         let rows: Vec<Row<'_>> = lines
             .iter()
-            .zip(&details)
-            .map(|(line, detail)| match &line.header {
+            .zip(&cells)
+            .map(|(line, cells)| match &line.header {
                 Some(header) => Row::Header(header),
                 None => Row::Item {
                     text: &line.text,
-                    detail: detail.as_deref(),
+                    detail: None,
                     signal: line.signal,
                     switch: line.available.then_some(line.active.is_some()),
+                    tree: &[],
+                    columns: cells,
+                    links: &[],
                 },
             })
             .collect();
@@ -255,14 +286,14 @@ impl Networks {
         form::screen(cx.ctx, pal, "networks", "Networks", rect, |ui| {
             let area = ui.available_rect_before_wrap();
             if editor.is_none() && station.is_none() {
-                press = form.list(ui, "list", &rows, &mut selected, area.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
                 return;
             }
             let split = area.right() - EDITOR_WIDTH;
             let list = Rect::from_min_max(area.min, pos2(split - GAP, area.bottom()));
             let pane = Rect::from_min_max(pos2(split, area.top()), area.max);
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-                press = form.list(ui, "list", &rows, &mut selected, list.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
             });
             ui.scope_builder(UiBuilder::new().max_rect(pane), |ui| {
                 let mark = form.mark();

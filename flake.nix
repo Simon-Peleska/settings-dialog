@@ -24,6 +24,29 @@
       ];
     in
     {
+      packages = forAll (pkgs:
+        let
+          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          rustPlatform = pkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
+        in
+        {
+          default = rustPlatform.buildRustPackage {
+            pname = "settings-dialog";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+            src = pkgs.lib.cleanSource ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              allowBuiltinFetchGit = true;
+            };
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            # winit and glutin load these with dlopen.
+            postFixup = ''
+              patchelf --add-rpath ${pkgs.lib.makeLibraryPath (runtimeLibs pkgs)} $out/bin/settings-dialog
+            '';
+            meta.mainProgram = "settings-dialog";
+          };
+        });
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [

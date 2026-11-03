@@ -6,6 +6,7 @@ pub mod networks;
 pub mod overlay;
 pub mod radar;
 pub mod sound;
+pub mod tasks;
 
 use crate::bt;
 use crate::form::Key;

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use egui::{Frame, Margin, Rect, RichText, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2};
 
 use super::{Action, Cx};
-use crate::form::{self, Form, Icon, Press, Row};
+use crate::form::{self, Form, Icon, Press, Row, Sort, Table};
 use crate::hypr::{Mode, Monitor, Request, Snapshot};
 use crate::light::{self, Auto, Backlight};
 use crate::tablet::{self, Tablet};
@@ -17,6 +17,15 @@ const CONFIRM: Duration = Duration::from_secs(10);
 /// it; without that the slider springs back to the old level mid-drag.
 const SETTLE: Duration = Duration::from_secs(1);
 const PANE_WIDTH: f32 = 600.0;
+const TABLE: Table = Table {
+    name: "Name",
+    columns: &[
+        ("Resolution", 110.0),
+        ("Refresh", 70.0),
+        ("Scale", 60.0),
+        ("Rotation", 90.0),
+    ],
+};
 const GAP: f32 = 20.0;
 const LABEL: f32 = 170.0;
 const FIELD: f32 = 300.0;
@@ -64,6 +73,8 @@ pub struct Displays {
     tablet: Option<Tablet>,
     /// Selects the tablet's output once a snapshot has it.
     find_tablet: bool,
+    /// `None` keeps connected screens first, in the order Hyprland lists them.
+    sort: Option<Sort>,
 }
 
 struct Confirm {
@@ -91,7 +102,8 @@ struct Line {
     /// Which monitor in the draft the row stands for.
     monitor: usize,
     text: String,
-    detail: String,
+    /// Resolution, refresh, scale and rotation as shown.
+    cells: [String; 4],
     switch: Option<bool>,
 }
 
@@ -110,6 +122,7 @@ impl Displays {
             auto: None,
             tablet: None,
             find_tablet: false,
+            sort: None,
         }
     }
 
@@ -219,16 +232,48 @@ impl Displays {
             auto: self.auto.is_some(),
             set: None,
         };
-        let lines = lines(&self.draft);
+        let mut lines = lines(&self.draft);
+        if let Some(sort) = self.sort {
+            let draft = &self.draft;
+            let mode = |line: &Line| {
+                draft[line.monitor]
+                    .mode
+                    .filter(|_| draft[line.monitor].enabled)
+            };
+            form::sort_groups(
+                &mut lines,
+                |l| l.header.is_some(),
+                sort,
+                |a, b| {
+                    let (one, two) = (&draft[a.monitor], &draft[b.monitor]);
+                    match sort.column {
+                        0 => form::by_text(&a.text, &b.text),
+                        1 => {
+                            let pixels = |line| mode(line).map(|m| m.width * m.height);
+                            pixels(a).cmp(&pixels(b))
+                        }
+                        2 => {
+                            let refresh = |line| mode(line).map_or(0.0, |m| m.refresh);
+                            refresh(a).total_cmp(&refresh(b))
+                        }
+                        3 => one.scale.total_cmp(&two.scale),
+                        _ => (one.transform % 4).cmp(&(two.transform % 4)),
+                    }
+                },
+            );
+        }
         let rows: Vec<Row<'_>> = lines
             .iter()
             .map(|line| match line.header {
                 Some(header) => Row::Header(header),
                 None => Row::Item {
                     text: &line.text,
-                    detail: Some(line.detail.as_str()),
+                    detail: None,
                     signal: None,
                     switch: line.switch,
+                    tree: &[],
+                    columns: &line.cells,
+                    links: &[],
                 },
             })
             .collect();
@@ -258,7 +303,7 @@ impl Displays {
                 }
             });
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-                press = form.list(ui, "list", &rows, &mut index, list.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut index);
             });
             if draft.is_empty() {
                 return;
@@ -398,7 +443,7 @@ fn lines(draft: &[Monitor]) -> Vec<Line> {
             }),
             monitor: usize::MAX,
             text: String::new(),
-            detail: String::new(),
+            cells: Default::default(),
             switch: None,
         });
         for index in group {
@@ -407,7 +452,7 @@ fn lines(draft: &[Monitor]) -> Vec<Line> {
                 header: None,
                 monitor: index,
                 text: monitor.label().to_owned(),
-                detail: detail(monitor),
+                cells: cells(monitor),
                 switch: monitor.connected.then_some(monitor.enabled),
             });
         }
@@ -415,27 +460,27 @@ fn lines(draft: &[Monitor]) -> Vec<Line> {
     lines
 }
 
-fn detail(monitor: &Monitor) -> String {
+fn cells(monitor: &Monitor) -> [String; 4] {
+    let alone = |text: &str| [text.to_owned(), String::new(), String::new(), String::new()];
     if !monitor.connected {
-        return "not connected".to_owned();
+        return alone("not connected");
     }
     if !monitor.enabled {
-        return "off".to_owned();
+        return alone("off");
     }
     let Some(mode) = monitor.mode else {
-        return "on".to_owned();
+        return alone("on");
     };
-    let scale = format!("{:.0} %", monitor.scale * 100.0);
     let turn = ROTATIONS
         .iter()
         .find(|(_, transform)| *transform == monitor.transform % 4)
         .map_or("", |(label, _)| *label);
-    let turn = if monitor.transform == 0 {
-        String::new()
-    } else {
-        format!("   {turn}")
-    };
-    format!("{}   {:.0} Hz   {scale}{turn}", mode.size(), mode.refresh)
+    [
+        mode.size(),
+        format!("{:.0} Hz", mode.refresh),
+        format!("{:.0} %", monitor.scale * 100.0),
+        turn.to_owned(),
+    ]
 }
 
 /// The selected screen's settings. `saved` is whether hyprland.lua loads the
@@ -918,7 +963,7 @@ fn field<R>(ui: &mut Ui, pal: &Palette, text: &str, add: impl FnOnce(&mut Ui) ->
 fn row(ui: &mut Ui, pal: &Palette, text: &str, value: &str) {
     ui.horizontal(|ui| {
         form::label(ui, pal, text, LABEL);
-        ui.label(RichText::new(value).color(pal.text));
+        ui.add(egui::Label::new(RichText::new(value).color(pal.text)).wrap());
     });
 }
 

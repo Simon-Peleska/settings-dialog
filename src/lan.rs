@@ -102,7 +102,7 @@ fn scan(device: &str, send: impl Fn(Result<Found, String>)) {
     if let Some((ip, prefix)) = parse_ipv4(&addr) {
         let (network, prefix) = net(ip, prefix);
         subnet = format!("{network}/{prefix}");
-        match knock(ip, network, prefix) {
+        match knock(device, ip, network, prefix) {
             Ok(sent) => log::debug!("knocked on {sent} addresses in {subnet}"),
             Err(err) => {
                 failed("LAN-3", "knock on the subnet", err.to_string());
@@ -240,7 +240,7 @@ fn net(ip: Ipv4Addr, prefix: u8) -> (Ipv4Addr, u8) {
 /// One UDP packet to every address of the net. Nobody has to listen on the
 /// discard port: the packet only makes the kernel ask for each MAC with ARP,
 /// and the answers land in the neighbour table. Needs no root, unlike ARP itself.
-fn knock(me: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> std::io::Result<usize> {
+fn knock(device: &str, me: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> std::io::Result<usize> {
     let size = 1u32 << (32 - u32::from(prefix));
     let mut sent = 0;
     let mut socket = None;
@@ -251,6 +251,16 @@ fn knock(me: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> std::io::Result<usize> 
         if offset % KNOCKS_PER_SOCKET == 1 {
             let fresh = UdpSocket::bind((me, 0))?;
             fresh.set_nonblocking(true)?;
+            // Another device on the same subnet (a cable beside the Wi-Fi) owns
+            // the route, so without this the knocks, and the MACs they learn,
+            // go out there and this device's neighbour table stays empty.
+            if let Err(err) = bind_to_device(&fresh, device) {
+                failed(
+                    "LAN-5",
+                    &format!("send the knocks out of {device}"),
+                    err.to_string(),
+                );
+            }
             socket = Some(fresh);
         }
         let ip = Ipv4Addr::from(u32::from(network) + offset);
@@ -262,6 +272,24 @@ fn knock(me: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> std::io::Result<usize> 
         }
     }
     Ok(sent)
+}
+
+fn bind_to_device(socket: &UdpSocket, device: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the name is a valid buffer of the given length for the call.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            device.as_ptr().cast(),
+            device.len() as libc::socklen_t,
+        )
+    };
+    match result {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 /// A lookup that runs while the others do, with its command line for the log.
@@ -561,6 +589,6 @@ mod tests {
     fn knocking_reaches_every_address_but_ours() {
         let me = Ipv4Addr::LOCALHOST;
         let (network, prefix) = net(me, 30);
-        assert_eq!(knock(me, network, prefix).unwrap(), 1);
+        assert_eq!(knock("lo", me, network, prefix).unwrap(), 1);
     }
 }

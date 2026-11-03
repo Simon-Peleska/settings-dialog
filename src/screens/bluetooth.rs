@@ -6,7 +6,7 @@ use super::overlay::Overlay;
 use super::{Action, Cx};
 use crate::bt::{self, Device, Request, Snapshot, manufacturer_name, service_name, signal_percent};
 use crate::finder::{Finder, Source};
-use crate::form::{self, Form, Icon, Press, Row};
+use crate::form::{self, Form, Icon, Press, Row, Sort, Table};
 use crate::theme::Palette;
 
 /// Often enough to watch the signal move while discovery runs.
@@ -22,6 +22,8 @@ pub struct Bluetooth {
     snap: Option<Result<Snapshot, String>>,
     scan_error: Option<String>,
     selected: Option<String>,
+    /// `None` keeps the order of the groups: connected first, strongest first.
+    sort: Option<Sort>,
     refreshed: Option<Instant>,
     scan_asked: Option<Instant>,
     finder: Option<Finder>,
@@ -31,10 +33,18 @@ struct Line {
     header: Option<String>,
     address: String,
     text: String,
-    detail: String,
+    battery: Option<u8>,
+    rssi: Option<i16>,
+    /// Battery and signal as shown.
+    cells: [String; 2],
     signal: Option<u8>,
     switch: Option<bool>,
 }
+
+const TABLE: Table = Table {
+    name: "Name",
+    columns: &[("Battery", 90.0), ("Signal", 90.0)],
+};
 
 impl Bluetooth {
     pub fn new() -> Self {
@@ -42,6 +52,7 @@ impl Bluetooth {
             snap: None,
             scan_error: None,
             selected: None,
+            sort: None,
             refreshed: None,
             scan_asked: None,
             finder: None,
@@ -99,18 +110,31 @@ impl Bluetooth {
             cx.bt.push(Request::Scan);
         }
 
-        let lines = snap.map(|snap| lines(snap, powered)).unwrap_or_default();
+        let mut lines = snap.map(|snap| lines(snap, powered)).unwrap_or_default();
+        if let Some(sort) = self.sort {
+            form::sort_groups(
+                &mut lines,
+                |l| l.header.is_some(),
+                sort,
+                |a, b| match sort.column {
+                    0 => form::by_text(&a.text, &b.text),
+                    1 => a.battery.cmp(&b.battery),
+                    _ => a.rssi.cmp(&b.rssi),
+                },
+            );
+        }
         let rows: Vec<Row<'_>> = lines
             .iter()
             .map(|line| match &line.header {
                 Some(header) => Row::Header(header),
                 None => Row::Item {
                     text: &line.text,
-                    detail: Some(&line.detail)
-                        .filter(|d| !d.is_empty())
-                        .map(|d| d.as_str()),
+                    detail: None,
                     signal: line.signal,
                     switch: line.switch,
+                    tree: &[],
+                    columns: &line.cells,
+                    links: &[],
                 },
             })
             .collect();
@@ -169,14 +193,14 @@ impl Bluetooth {
             }
             let area = ui.available_rect_before_wrap();
             let Some(device) = device else {
-                press = form.list(ui, "list", &rows, &mut selected, area.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
                 return;
             };
             let split = area.right() - PANE_WIDTH;
             let list = Rect::from_min_max(area.min, pos2(split - GAP, area.bottom()));
             let pane = Rect::from_min_max(pos2(split, area.top()), area.max);
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-                press = form.list(ui, "list", &rows, &mut selected, list.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
             });
             ui.scope_builder(UiBuilder::new().max_rect(pane), |ui| {
                 let mark = form.mark();
@@ -238,23 +262,24 @@ fn lines(snap: &Snapshot, powered: bool) -> Vec<Line> {
         header: Some(text),
         address: String::new(),
         text: String::new(),
-        detail: String::new(),
+        battery: None,
+        rssi: None,
+        cells: Default::default(),
         signal: None,
         switch: None,
     };
     let line = |device: &Device| {
-        let mut detail = Vec::new();
-        if let Some(battery) = device.battery {
-            detail.push(format!("battery {battery} %"));
-        }
-        if let Some(rssi) = device.rssi {
-            detail.push(format!("{rssi} dBm"));
-        }
+        let battery = device.battery.map_or(String::new(), |b| format!("{b} %"));
+        let rssi = device
+            .rssi
+            .map_or(String::new(), |rssi| format!("{rssi} dBm"));
         Line {
             header: None,
             address: device.address.clone(),
             text: device.alias.clone(),
-            detail: detail.join("   "),
+            battery: device.battery,
+            rssi: device.rssi,
+            cells: [battery, rssi],
             signal: device.rssi.map(signal_percent),
             switch: powered.then_some(device.connected),
         }
@@ -537,7 +562,7 @@ mod tests {
                 ("12-34", Some(false)),
             ]
         );
-        assert_eq!(shown_lines[4].detail, "-50 dBm");
+        assert_eq!(shown_lines[4].cells, ["", "-50 dBm"]);
         assert!(lines(&snap, false).iter().all(|l| l.switch.is_none()));
     }
 

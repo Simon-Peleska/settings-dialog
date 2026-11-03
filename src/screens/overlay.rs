@@ -6,7 +6,7 @@ use super::graph::Graph;
 use super::{Action, Cx, radar};
 use crate::bt;
 use crate::finder::{Finder, Source};
-use crate::form::{self, Form, FormState, Icon};
+use crate::form::{self, Form, FormState, Icon, Press, Row, Sort, Table};
 use crate::lan;
 use crate::nm::{Beacon, Connection, Request};
 use crate::pw;
@@ -53,10 +53,15 @@ enum OverlayKind {
     Devices {
         title: String,
         device: String,
-        scan: lan::Scan,
+        /// Boxed to keep `Action` small.
+        scan: Box<lan::Scan>,
         /// Beeping for one of the devices in the list, when the radio has a
         /// signal for it. Boxed to keep `Action` small.
         finder: Option<Box<Finder>>,
+        /// `None` keeps the order the devices answered in.
+        sort: Option<Sort>,
+        /// The MAC address of the selected device.
+        selected: Option<String>,
     },
     Graph {
         snap: Option<Box<Result<pw::Snapshot, String>>>,
@@ -133,7 +138,7 @@ impl Overlay {
     }
 
     pub fn devices(ctx: egui::Context, title: String, device: String) -> Self {
-        let scan = lan::Scan::start(ctx, device.clone());
+        let scan = Box::new(lan::Scan::start(ctx, device.clone()));
         Self::with(
             "close",
             OverlayKind::Devices {
@@ -141,6 +146,8 @@ impl Overlay {
                 device,
                 scan,
                 finder: None,
+                sort: None,
+                selected: None,
             },
         )
     }
@@ -344,6 +351,8 @@ impl Overlay {
                 device,
                 scan,
                 finder,
+                sort,
+                selected,
             } => {
                 scan.poll();
                 if let Some(finder) = finder.as_mut() {
@@ -353,7 +362,8 @@ impl Overlay {
                 let mut find = None;
                 let mut rescan = false;
                 form::popup(cx.ctx, pal, "devices", title, |ui| {
-                    ui.set_min_width(860.0);
+                    let width = (cx.ctx.content_rect().width() - 200.0).clamp(860.0, 1400.0);
+                    ui.set_min_width(width);
                     match &scan.found {
                         None => {
                             ui.horizontal(|ui| {
@@ -380,25 +390,81 @@ impl Overlay {
                                     ui.add(egui::Spinner::new().color(pal.accent));
                                 }
                             });
-                            if let Some(err) = finder.as_ref().and_then(|f| f.error.as_deref()) {
-                                ui.label(RichText::new(err).color(pal.danger));
-                            }
                             ui.add_space(6.0);
-                            find = egui::ScrollArea::vertical()
-                                .max_height(height)
-                                .show(ui, |ui| {
-                                    hosts(ui, &mut form, pal, &found.hosts, finder.as_deref())
+                            let mut hosts: Vec<&lan::Host> = found.hosts.iter().collect();
+                            if let Some(sort) = *sort {
+                                sort_hosts(&mut hosts, sort);
+                            }
+                            let cells: Vec<[String; 3]> = hosts
+                                .iter()
+                                .map(|host| {
+                                    let ping =
+                                        host.ping.map_or(String::new(), |ms| format!("{ms:.0} ms"));
+                                    [host.ipv4.clone(), host.vendor.clone(), ping]
                                 })
-                                .inner;
+                                .collect();
+                            let links: Vec<[Option<String>; 2]> = hosts
+                                .iter()
+                                .map(|host| [name_url(host), form::web_url(&host.ipv4)])
+                                .collect();
+                            let rows: Vec<Row<'_>> = hosts
+                                .iter()
+                                .zip(&cells)
+                                .zip(&links)
+                                .map(|((host, cells), links)| Row::Item {
+                                    text: match host.hostname.as_str() {
+                                        "" => "unknown",
+                                        name => name,
+                                    },
+                                    detail: role(host),
+                                    signal: None,
+                                    switch: None,
+                                    tree: &[],
+                                    columns: cells,
+                                    links,
+                                })
+                                .collect();
+                            let mut index = selected
+                                .as_ref()
+                                .and_then(|mac| hosts.iter().position(|h| &h.mac == mac))
+                                .unwrap_or(0);
+                            let wanted =
+                                form::HEADS_HEIGHT + rows.len() as f32 * form::ROW_HEIGHT + 12.0;
+                            let size =
+                                egui::vec2(ui.available_width(), wanted.max(360.0).min(height));
+                            let (area, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                            let split = area.right() - HOST_PANE;
+                            let list = egui::Rect::from_min_max(
+                                area.min,
+                                egui::pos2(split - 20.0, area.bottom()),
+                            );
+                            let pane =
+                                egui::Rect::from_min_max(egui::pos2(split, area.top()), area.max);
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
+                                let press =
+                                    form.table(ui, "hosts", &HOSTS, sort, &rows, &mut index);
+                                let host = hosts.get(index);
+                                *selected = host.map(|host| host.mac.clone());
+                                if press == Some(Press::Row)
+                                    && let Some(host) = host.filter(|host| host.radio)
+                                {
+                                    find = Some((host.mac.clone(), host.ipv4.clone()));
+                                }
+                            });
+                            if let Some(host) = hosts.get(index) {
+                                let found = finder.as_deref().filter(|f| f.key == host.mac);
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(pane), |ui| {
+                                    if host_pane(ui, &mut form, pane, host, found) {
+                                        find = Some((host.mac.clone(), host.ipv4.clone()));
+                                    }
+                                });
+                            }
                         }
                     }
                     ui.add_space(12.0);
-                    match form::button_row(
-                        &mut form,
-                        ui,
-                        &[("rescan", "Scan again"), ("close", "Close")],
-                    ) {
-                        Some(0) => rescan = true,
+                    let buttons = [("rescan", "Scan again"), ("close", "Close")];
+                    match form::button_row(&mut form, ui, &buttons).map(|i| buttons[i].0) {
+                        Some("rescan") => rescan = true,
                         Some(_) => action = Some(Action::Pop),
                         None => {}
                     }
@@ -418,7 +484,7 @@ impl Overlay {
                     };
                 }
                 if rescan {
-                    *scan = lan::Scan::start(cx.ctx.clone(), device.clone());
+                    **scan = lan::Scan::start(cx.ctx.clone(), device.clone());
                     *finder = None;
                 }
             }
@@ -505,92 +571,192 @@ impl Overlay {
     }
 }
 
-/// One row per device: name with its role, addresses (IPv6 dimmed under the
-/// IPv4 one), MAC, manufacturer and ping.
-/// The MAC and IPv4 address of the device whose find button was pressed.
-fn hosts(
+const HOSTS: Table = Table {
+    name: "Name",
+    columns: &[("Address", 150.0), ("Manufacturer", 220.0), ("Ping", 80.0)],
+};
+const HOST_PANE: f32 = 460.0;
+const HOST_LABEL: f32 = 120.0;
+
+fn name_url(host: &lan::Host) -> Option<String> {
+    (!host.hostname.is_empty()).then(|| format!("http://{}/", host.hostname))
+}
+
+fn role(host: &lan::Host) -> Option<&'static str> {
+    match (host.router, host.me) {
+        (true, _) => Some("router"),
+        (_, true) => Some("this computer"),
+        _ => None,
+    }
+}
+
+/// Everything about the selected device. Returns whether Find by sound (or
+/// its stop) was pressed.
+fn host_pane(
     ui: &mut egui::Ui,
     form: &mut Form<'_>,
-    pal: &crate::theme::Palette,
-    hosts: &[lan::Host],
+    pane: egui::Rect,
+    host: &lan::Host,
     finding: Option<&Finder>,
-) -> Option<(String, String)> {
-    let mut find = None;
-    egui::Grid::new("lan_hosts")
-        .num_columns(6)
-        .spacing(egui::vec2(20.0, 8.0))
-        .striped(false)
+) -> bool {
+    let pal = form.pal().clone();
+    let mut pressed = false;
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, pal.outline))
+        .corner_radius(3)
         .show(ui, |ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-            for heading in [
-                "Name",
-                "Address",
-                "MAC address",
-                "Manufacturer",
-                "Ping",
-                "Signal",
-            ] {
-                ui.label(RichText::new(heading).color(pal.dim));
-            }
-            ui.end_row();
-            for host in hosts {
-                ui.vertical(|ui| {
-                    match host.hostname.as_str() {
-                        "" => {
-                            ui.label(RichText::new("unknown").color(pal.dim));
-                        }
-                        name => {
-                            let url = format!("http://{name}/");
-                            form::link(ui, pal, RichText::new(name), &url);
-                        }
-                    }
-                    let role = match (host.router, host.me) {
-                        (true, _) => "router",
-                        (_, true) => "this computer",
-                        _ => "",
+            let inner = pane.size() - egui::vec2(2.0, 2.0);
+            ui.set_min_size(inner);
+            ui.set_max_width(inner.x);
+            let header = egui::Margin {
+                bottom: 10,
+                ..egui::Margin::same(16)
+            };
+            egui::Frame::new().inner_margin(header).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let name = match host.hostname.as_str() {
+                        "" => "unknown",
+                        name => name,
                     };
-                    if !role.is_empty() {
-                        ui.label(RichText::new(role).color(pal.info).small());
+                    ui.label(
+                        RichText::new(name)
+                            .font(fastframe_fonts::Weight::SemiBold.font_id(16.0))
+                            .color(pal.text),
+                    );
+                    if host.radio {
+                        ui.add_space((ui.available_width() - form::FIELD_HEIGHT).max(0.0));
+                        let (icon, tip) = match finding {
+                            Some(_) => (Icon::Stop, "Stop the sound"),
+                            None => (Icon::Find, "Find by sound"),
+                        };
+                        pressed = form.icon_button(ui, "host-find", icon, tip);
                     }
                 });
-                ui.vertical(|ui| {
-                    if let Some(url) = form::web_url(&host.ipv4) {
-                        form::link(ui, pal, RichText::new(&host.ipv4).monospace(), &url);
-                    }
-                    for ip in &host.ipv6 {
-                        let text = RichText::new(ip).monospace().small();
-                        match form::web_url(ip) {
-                            Some(url) => form::link(ui, pal, text, &url),
+            });
+            let y = ui.cursor().top();
+            ui.painter().hline(
+                ui.max_rect().x_range(),
+                y,
+                egui::Stroke::new(1.0, pal.outline),
+            );
+            egui::Frame::new().inner_margin(16).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if let Some(err) = finding.and_then(|f| f.error.as_deref()) {
+                    ui.label(RichText::new(err).color(pal.danger));
+                }
+                let field = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(HOST_LABEL, 0.0),
+                            egui::Layout::right_to_left(egui::Align::Min),
+                            |ui| ui.label(RichText::new(label).color(pal.secondary)),
+                        );
+                        ui.vertical(add);
+                    });
+                };
+                let text = |value: &str| RichText::new(value).color(pal.text);
+                if let Some(role) = role(host) {
+                    field(ui, "Role", &mut |ui| {
+                        ui.label(text(role));
+                    });
+                }
+                if let Some(url) = name_url(host) {
+                    field(ui, "Hostname", &mut |ui| {
+                        form::link(ui, &pal, RichText::new(&host.hostname), &url)
+                    });
+                }
+                if !host.ipv4.is_empty() {
+                    field(
+                        ui,
+                        "IPv4 address",
+                        &mut |ui| match form::web_url(&host.ipv4) {
+                            Some(url) => form::link(ui, &pal, RichText::new(&host.ipv4), &url),
                             None => {
-                                ui.label(text.color(pal.dim));
+                                ui.label(text(&host.ipv4));
+                            }
+                        },
+                    );
+                }
+                if !host.ipv6.is_empty() {
+                    field(ui, "IPv6 addresses", &mut |ui| {
+                        for ip in &host.ipv6 {
+                            match form::web_url(ip) {
+                                Some(url) => form::link(ui, &pal, RichText::new(ip), &url),
+                                None => {
+                                    ui.label(text(ip));
+                                }
                             }
                         }
-                    }
-                });
-                ui.label(RichText::new(&host.mac).monospace());
-                ui.label(&host.vendor);
-                match host.ping {
-                    Some(ms) => ui.label(format!("{ms:.0} ms")),
-                    None => ui.label(""),
-                };
-                ui.horizontal(|ui| {
-                    if !host.radio {
-                        return;
-                    }
-                    let found = finding.filter(|finder| finder.key == host.mac);
-                    let (icon, tip) = match found {
-                        Some(_) => (Icon::Stop, "Stop the sound"),
-                        None => (Icon::Find, "Find by sound"),
-                    };
-                    if form.icon_button(ui, &format!("find-{}", host.mac), icon, tip) {
-                        find = Some((host.mac.clone(), host.ipv4.clone()));
-                    }
-                    if let Some(finder) = found {
-                        ui.label(RichText::new(finder.text()).color(pal.text));
-                    }
-                });
-                ui.end_row();
-            }
+                    });
+                }
+                let mut rows = vec![
+                    ("MAC address", host.mac.clone()),
+                    ("Manufacturer", host.vendor.clone()),
+                    (
+                        "Ping",
+                        host.ping.map_or(String::new(), |ms| format!("{ms:.0} ms")),
+                    ),
+                ];
+                if host.radio {
+                    let signal = finding.map_or("in range".to_owned(), |f| f.text());
+                    rows.push(("Signal", signal));
+                }
+                for (label, value) in rows.into_iter().filter(|(_, v)| !v.is_empty()) {
+                    field(ui, label, &mut |ui| {
+                        ui.add(egui::Label::new(text(&value)).wrap());
+                    });
+                }
+            });
         });
-    find
+    pressed
+}
+
+fn sort_hosts(hosts: &mut [&lan::Host], sort: Sort) {
+    let ipv4 = |host: &lan::Host| host.ipv4.parse::<std::net::Ipv4Addr>().ok();
+    let ping = |host: &lan::Host| host.ping.unwrap_or(-1.0);
+    hosts.sort_by(|a, b| {
+        let order = match sort.column {
+            0 => form::by_text(&a.hostname, &b.hostname),
+            1 => ipv4(a).cmp(&ipv4(b)),
+            2 => form::by_text(&a.vendor, &b.vendor),
+            _ => ping(a).total_cmp(&ping(b)),
+        };
+        if sort.descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn devices_sort_by_address_as_numbers_and_by_ping() {
+        let host = |ipv4: &str, ping| lan::Host {
+            ipv4: ipv4.to_owned(),
+            ping,
+            ..lan::Host::default()
+        };
+        let all = [
+            host("192.168.1.10", Some(3.0)),
+            host("192.168.1.9", None),
+            host("192.168.1.100", Some(12.0)),
+        ];
+        let shown = |column, descending| {
+            let mut hosts: Vec<&lan::Host> = all.iter().collect();
+            sort_hosts(&mut hosts, Sort { column, descending });
+            hosts.iter().map(|h| h.ipv4.as_str()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(1, false),
+            ["192.168.1.9", "192.168.1.10", "192.168.1.100"]
+        );
+        assert_eq!(
+            shown(3, true),
+            ["192.168.1.100", "192.168.1.10", "192.168.1.9"]
+        );
+    }
 }

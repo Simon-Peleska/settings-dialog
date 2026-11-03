@@ -114,7 +114,10 @@ fastframe_icons::icons! {
         Muted => "volume-x",
         Find => "audio-lines",
         Stop => lucide "square",
+        Kill => lucide "x",
         Graph => "workflow",
+        Tree => "list-tree",
+        List => "list",
         Network => "network",
         Tablet => "tablet",
         ChevronDown => lucide "chevron-down",
@@ -136,7 +139,136 @@ pub enum Row<'a> {
         detail: Option<&'a str>,
         signal: Option<u8>,
         switch: Option<bool>,
+        /// The lines in front of a row in a tree, one per level; empty outside one.
+        tree: &'a [Guide],
+        /// Right-aligned values at the right end, under a `table`'s columns.
+        columns: &'a [String],
+        /// Links for the name and then each column, by position; empty for none.
+        links: &'a [Option<String>],
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guide {
+    /// An ancestor here has no more siblings below.
+    Blank,
+    /// An ancestor here has more siblings below.
+    Line,
+    /// The row's own branch, with more siblings below.
+    Tee,
+    /// The row's own branch, as the last sibling.
+    Corner,
+}
+
+const TREE_INDENT: f32 = 20.0;
+/// A value column's width when a plain `list` row has columns.
+const COLUMN: f32 = 100.0;
+const ROW_INSET: f32 = 6.0;
+/// The room between a value and the one left of it.
+const COLUMN_GAP: f32 = 20.0;
+/// Between two column heads, as wide as their margin to the border.
+const HEAD_GAP: f32 = 4.0;
+pub const HEADS_HEIGHT: f32 = 30.0;
+
+/// The column heads of a `table`: the name heads the row text, then the
+/// right-aligned value columns with the most room each may take. A column
+/// shrinks to its widest value; longer values end in "…".
+pub struct Table<'a> {
+    pub name: &'a str,
+    pub columns: &'a [(&'a str, f32)],
+}
+
+/// Column 0 is the name, then the value columns in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    pub column: usize,
+    pub descending: bool,
+}
+
+/// Sorts the rows between section headers, so each group stays under its own.
+pub fn sort_groups<T>(
+    lines: &mut [T],
+    header: impl Fn(&T) -> bool,
+    sort: Sort,
+    order: impl Fn(&T, &T) -> std::cmp::Ordering,
+) {
+    for group in lines.split_mut(header) {
+        group.sort_by(|a, b| match sort.descending {
+            true => order(b, a),
+            false => order(a, b),
+        });
+    }
+}
+
+/// The same column again flips the direction; a new one starts A–Z for the
+/// name and largest first for the rest.
+fn pick(sort: &mut Option<Sort>, column: usize) {
+    *sort = Some(match *sort {
+        Some(now) if now.column == column => Sort {
+            column,
+            descending: !now.descending,
+        },
+        _ => Sort {
+            column,
+            descending: column != 0,
+        },
+    });
+}
+
+fn log_sort(id: &str, labels: &[&str], before: Option<Sort>, sort: Option<Sort>) {
+    let Some(sort) = sort.filter(|sort| Some(*sort) != before) else {
+        return;
+    };
+    let direction = if sort.descending {
+        "descending"
+    } else {
+        "ascending"
+    };
+    log::info!("{id} sorted by {}, {direction}", labels[sort.column]);
+}
+
+/// Text order ignoring case.
+pub fn by_text(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.chars(), b.chars());
+    a.flat_map(char::to_lowercase)
+        .cmp(b.flat_map(char::to_lowercase))
+}
+
+/// Where a row's value columns go. In a table every row keeps room for signal
+/// bars and a switch if any row has them, so the columns line up.
+struct Layout<'a> {
+    signal: bool,
+    switch: bool,
+    widths: &'a [f32],
+}
+
+impl Layout<'_> {
+    /// Where the signal bars start, and where the last value column ends.
+    fn trailing(&self, row: Rect) -> (f32, f32) {
+        let signal_x = match self.switch {
+            true => row.right() - 80.0,
+            false => row.right() - 32.0,
+        };
+        let right = match (self.signal, self.switch) {
+            (true, _) => signal_x - 8.0,
+            (false, true) => switch_rect(row).left() - 8.0,
+            (false, false) => row.right() - ROW_INSET,
+        };
+        (signal_x, right)
+    }
+
+    fn width(&self, column: usize) -> f32 {
+        self.widths.get(column).copied().unwrap_or(COLUMN)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Plain,
+    Hovered,
+    Selected,
+    /// Selected in the focused list.
+    Lit,
 }
 
 impl Row<'_> {
@@ -706,6 +838,206 @@ impl<'a> Form<'a> {
         selected: &mut usize,
         size: Vec2,
     ) -> Option<Press> {
+        self.rows(ui, id, rows, selected, size, None)
+    }
+
+    /// A list under column heads; clicking a head sorts by that column, again
+    /// flips the direction. With the focus on the heads, ← and → pick a column
+    /// and Space or Enter flips it. The caller sorts the rows by `sort`, and
+    /// `None` keeps its own order. Fills the space left in `ui`.
+    pub fn table(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        table: &Table<'_>,
+        sort: &mut Option<Sort>,
+        rows: &[Row<'_>],
+        selected: &mut usize,
+    ) -> Option<Press> {
+        let measure = |text: &str, font: FontId| {
+            let galley = ui
+                .painter()
+                .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+            galley.size().x
+        };
+        let widths: Vec<f32> = (table.columns.iter().enumerate())
+            .map(|(column, (label, most))| {
+                // Room for the chevron at the head's left edge, even in a column capped narrower.
+                let head = measure(label, Weight::SemiBold.font_id(13.0))
+                    + 25.0
+                    + 2.0 * ROW_INSET
+                    + HEAD_GAP;
+                let widest = rows
+                    .iter()
+                    .filter_map(|row| match row {
+                        Row::Item { columns, .. } => columns.get(column),
+                        Row::Header(_) => None,
+                    })
+                    .map(|value| measure(value, FontId::proportional(13.0)))
+                    .fold(head, f32::max);
+                (widest + COLUMN_GAP).min(*most).max(head)
+            })
+            .collect();
+        let layout = Layout {
+            signal: rows.iter().any(|row| {
+                matches!(
+                    row,
+                    Row::Item {
+                        signal: Some(_),
+                        ..
+                    }
+                )
+            }),
+            switch: rows.iter().any(|row| row.switch().is_some()),
+            widths: &widths,
+        };
+        let area = ui.available_rect_before_wrap();
+        let (heads, list) = area.split_top_bottom_at_y(area.top() + HEADS_HEIGHT);
+        ui.painter()
+            .rect_filled(heads, CornerRadius::same(3), self.pal.window);
+        self.heads(ui, id, table, &layout, heads, sort);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
+            self.rows(ui, id, rows, selected, list.size(), Some(&layout))
+        })
+        .inner
+    }
+
+    fn heads(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        table: &Table<'_>,
+        layout: &Layout<'_>,
+        rect: Rect,
+        sort: &mut Option<Sort>,
+    ) {
+        let before = *sort;
+        let count = table.columns.len() + 1;
+        let focused = self.sort_keys(id, count, sort);
+
+        // Lined up with the rows inside the list's frame: 1 stroke and 4 margin.
+        let row = rect.shrink(5.0);
+        let (_, right) = layout.trailing(row);
+        let values = table.columns.len();
+        let end_of =
+            |value: usize| right - (value + 1..values).map(|c| layout.width(c)).sum::<f32>();
+        let names_end = end_of(0) - layout.width(0) + ROW_INSET;
+        for column in 0..count {
+            let (label, cell) = match column {
+                0 => (
+                    table.name,
+                    Rect::from_min_max(row.min, pos2(names_end - HEAD_GAP, row.bottom())),
+                ),
+                _ => {
+                    let end = end_of(column - 1);
+                    let left = end - layout.width(column - 1) + ROW_INSET + HEAD_GAP;
+                    let cell = Rect::from_min_max(
+                        pos2(left, row.top()),
+                        pos2(end + ROW_INSET, row.bottom()),
+                    );
+                    (table.columns[column - 1].0, cell)
+                }
+            };
+            self.head(
+                ui,
+                id,
+                cell,
+                column,
+                label,
+                column > 0,
+                before,
+                focused,
+                sort,
+            );
+        }
+        let labels: Vec<&str> = std::iter::once(table.name)
+            .chain(table.columns.iter().map(|(label, _)| *label))
+            .collect();
+        log_sort(id, &labels, before, *sort);
+    }
+
+    /// Takes the keys while the heads have the focus; returns whether they have it.
+    fn sort_keys(&mut self, id: &str, count: usize, sort: &mut Option<Sort>) -> bool {
+        let Some(keys) = self.custom(&format!("{id}-sort")) else {
+            return false;
+        };
+        for key in keys {
+            let column = sort.map_or(0, |sort| sort.column);
+            match key {
+                Key::Left => pick(sort, column.saturating_sub(1)),
+                Key::Right => pick(sort, (column + 1).min(count - 1)),
+                Key::Enter | Key::Space => pick(sort, column),
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// One column head: sorts on a click and shows the direction with a chevron.
+    #[allow(clippy::too_many_arguments)]
+    fn head(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        cell: Rect,
+        column: usize,
+        label: &str,
+        right_aligned: bool,
+        before: Option<Sort>,
+        focused: bool,
+        sort: &mut Option<Sort>,
+    ) {
+        let heads_id = format!("{id}-sort");
+        let response = ui.interact(cell, ui.id().with((&heads_id, column)), Sense::click());
+        if response.clicked() {
+            self.click(&heads_id);
+            pick(sort, column);
+        }
+        let pal = self.pal;
+        let current = before.filter(|sort| sort.column == column);
+        let (fill, color) = match (current.is_some(), focused, response.hovered()) {
+            (true, true, _) => (Some(pal.accent), pal.on_accent),
+            (false, true, _) if before.is_none() && column == 0 => {
+                (Some(pal.accent), pal.on_accent)
+            }
+            (_, _, true) => (Some(pal.surface_hover), pal.text),
+            (true, _, _) => (None, pal.text),
+            _ => (None, pal.secondary),
+        };
+        if let Some(fill) = fill {
+            ui.painter().rect_filled(cell, CornerRadius::same(3), fill);
+        }
+        let galley =
+            ui.painter()
+                .layout_no_wrap(label.to_owned(), Weight::SemiBold.font_id(13.0), color);
+        let width = galley.size().x;
+        let chevron = if current.is_some() { 18.0 } else { 0.0 };
+        let text_x = match right_aligned {
+            false => cell.left() + 7.0 + chevron,
+            true => cell.right() - ROW_INSET - width,
+        };
+        let chevron_x = cell.left() + 7.0;
+        let y = cell.center().y - galley.size().y / 2.0;
+        ui.painter().galley(pos2(text_x, y), galley, color);
+        if let Some(current) = current {
+            let icon = match current.descending {
+                true => Icon::ChevronDown,
+                false => Icon::ChevronUp,
+            };
+            let at = Rect::from_min_size(pos2(chevron_x, cell.center().y - 7.0), Vec2::splat(14.0));
+            icon.image(color, 14.0).paint_at(ui, at);
+        }
+    }
+
+    fn rows(
+        &mut self,
+        ui: &mut Ui,
+        id: &str,
+        rows: &[Row<'_>],
+        selected: &mut usize,
+        size: Vec2,
+        table: Option<&Layout<'_>>,
+    ) -> Option<Press> {
         let focused = self.register(id, Kind::Other);
         let selectable: Vec<usize> = (0..rows.len()).filter(|i| rows[*i].selectable()).collect();
         if !selectable.contains(selected) {
@@ -737,12 +1069,14 @@ impl<'a> Form<'a> {
 
         let pal = self.pal;
         let mut clicked: Option<(usize, Option<Press>)> = None;
+        let border = Stroke::new(1.0, if focused { pal.accent } else { pal.outline });
         let frame = Frame::new()
             .fill(pal.window)
-            .stroke(Stroke::new(
-                1.0,
-                if focused { pal.accent } else { pal.outline },
-            ))
+            .stroke(if table.is_some() {
+                Stroke::NONE
+            } else {
+                border
+            })
             .corner_radius(CornerRadius::same(3))
             .inner_margin(Margin::same(4))
             .show(ui, |ui| {
@@ -782,15 +1116,26 @@ impl<'a> Form<'a> {
                                     }
                                 }
                                 let current = index == *selected;
-                                draw_row(
-                                    ui,
-                                    pal,
-                                    rect,
-                                    row,
-                                    current,
-                                    focused,
-                                    response.hovered() || switch_hovered,
-                                );
+                                let hovered = response.hovered() || switch_hovered;
+                                let look = match (current, focused, hovered) {
+                                    (true, true, _) => Look::Lit,
+                                    (true, false, _) => Look::Selected,
+                                    (false, _, true) => Look::Hovered,
+                                    _ => Look::Plain,
+                                };
+                                let own = Layout {
+                                    signal: matches!(
+                                        row,
+                                        Row::Item {
+                                            signal: Some(_),
+                                            ..
+                                        }
+                                    ),
+                                    switch: row.switch().is_some(),
+                                    widths: &[],
+                                };
+                                let row_id = ui.id().with((id, "row", index));
+                                draw_row(ui, pal, row_id, rect, row, table.unwrap_or(&own), look);
                                 if current && (moved || self.state.reveal && focused) {
                                     ui.scroll_to_rect(rect, None);
                                 }
@@ -798,6 +1143,19 @@ impl<'a> Form<'a> {
                         })
                     });
             });
+        // A table's border goes around its heads too, with a line below them.
+        if table.is_some() {
+            let list = frame.response.rect;
+            let outer = Rect::from_min_max(pos2(list.left(), list.top() - HEADS_HEIGHT), list.max);
+            let painter = ui.painter();
+            painter.hline(outer.x_range(), list.top(), Stroke::new(1.0, pal.outline));
+            painter.rect_stroke(
+                outer,
+                CornerRadius::same(3),
+                border,
+                egui::StrokeKind::Inside,
+            );
+        }
         if frame.response.clicked() {
             self.click(id);
         }
@@ -926,18 +1284,19 @@ impl<'a> Form<'a> {
     }
 }
 
+/// Paints a row. Its links answer clicks of their own, so `id` must be the row's.
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ui: &Ui,
     pal: &Palette,
+    id: Id,
     rect: Rect,
     row: &Row<'_>,
-    selected: bool,
-    focused: bool,
-    hovered: bool,
+    layout: &Layout<'_>,
+    look: Look,
 ) {
     let painter = ui.painter();
-    let (text, detail, signal, switch) = match row {
+    let (text, detail, signal, switch, tree, columns, links) = match row {
         Row::Header(text) => {
             painter.text(
                 pos2(rect.left() + 6.0, rect.center().y),
@@ -953,29 +1312,71 @@ fn draw_row(
             detail,
             signal,
             switch,
-        } => (*text, *detail, *signal, *switch),
+            tree,
+            columns,
+            links,
+        } => (*text, *detail, *signal, *switch, *tree, *columns, *links),
     };
-    let lit = selected && focused;
-    let (fill, color) = match (selected, focused) {
-        (true, true) => (Some(pal.accent), pal.on_accent),
-        (true, false) => (Some(pal.surface_active), pal.text),
-        _ if hovered => (Some(pal.surface), pal.text),
-        _ => (None, pal.text),
+    let lit = look == Look::Lit;
+    let (fill, color) = match look {
+        Look::Lit => (Some(pal.accent), pal.on_accent),
+        Look::Selected => (Some(pal.surface_active), pal.text),
+        Look::Hovered => (Some(pal.surface), pal.text),
+        Look::Plain => (None, pal.text),
     };
     if let Some(fill) = fill {
         painter.rect_filled(rect, CornerRadius::same(2), fill);
     }
+    // A link opens on a click, underlines on hover, and turns red with the
+    // error as its tooltip when opening failed. Returns the text colour.
+    let link = |position: usize, text_rect: Rect, plain: Color32| {
+        let Some(Some(url)) = links.get(position) else {
+            return plain;
+        };
+        let response = ui
+            .interact(text_rect, id.with(("link", position)), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if response.clicked() {
+            open_url(ui.ctx(), url);
+        }
+        let failed = url_error(ui.ctx(), url);
+        let color = match (&failed, lit) {
+            (Some(_), _) => pal.danger,
+            (None, true) => pal.on_accent,
+            (None, false) => pal.info,
+        };
+        if response.hovered() {
+            painter.hline(
+                text_rect.x_range(),
+                text_rect.bottom(),
+                Stroke::new(1.0, color),
+            );
+        }
+        if let Some(err) = failed {
+            response.on_hover_text(err);
+        }
+        color
+    };
 
-    let signal_x = if switch.is_some() {
-        rect.right() - 80.0
-    } else {
-        rect.right() - 32.0
-    };
-    let mut text_right = match (signal, switch) {
-        (Some(_), _) => signal_x - 8.0,
-        (None, Some(_)) => switch_rect(rect).left() - 8.0,
-        (None, None) => rect.right() - 6.0,
-    };
+    let (signal_x, mut text_right) = layout.trailing(rect);
+    for (column, value) in columns.iter().enumerate().rev() {
+        let dim = if lit { pal.on_accent } else { pal.secondary };
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            value.clone(),
+            FontId::proportional(13.0),
+            Color32::PLACEHOLDER,
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width(layout.width(column) - COLUMN_GAP);
+        let galley = painter.layout_job(job);
+        let at = pos2(
+            text_right - galley.size().x,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        let color = link(column + 1, Rect::from_min_size(at, galley.size()), dim);
+        painter.galley(at, galley, color);
+        text_right -= layout.width(column);
+    }
+
     if let Some(detail) = detail {
         let dim = if lit { pal.on_accent } else { pal.secondary };
         let galley = painter.layout_no_wrap(detail.to_owned(), FontId::proportional(13.0), dim);
@@ -987,21 +1388,40 @@ fn draw_row(
         );
         text_right = left - 12.0;
     }
+    let guide_color = if lit { pal.on_accent } else { pal.outline };
+    let guide_stroke = Stroke::new(1.0, guide_color);
+    for (level, guide) in tree.iter().enumerate() {
+        let x = (rect.left() + 18.0 + level as f32 * TREE_INDENT).round() + 0.5;
+        let middle = rect.center().y.round() + 0.5;
+        let bottom = match guide {
+            Guide::Blank => continue,
+            Guide::Line | Guide::Tee => rect.bottom(),
+            Guide::Corner => middle,
+        };
+        painter.line_segment([pos2(x, rect.top()), pos2(x, bottom)], guide_stroke);
+        if *guide != Guide::Line {
+            let end = x + TREE_INDENT - 8.0;
+            painter.line_segment([pos2(x, middle), pos2(end, middle)], guide_stroke);
+        }
+    }
     let text_rect = Rect::from_min_max(
-        pos2(rect.left() + 12.0, rect.top()),
+        pos2(
+            rect.left() + 12.0 + tree.len() as f32 * TREE_INDENT,
+            rect.top(),
+        ),
         pos2(text_right, rect.bottom()),
     );
-    let galley = painter.layout(
+    let mut job = egui::text::LayoutJob::simple_singleline(
         text.to_owned(),
         FontId::proportional(14.0),
-        color,
-        f32::INFINITY,
+        Color32::PLACEHOLDER,
     );
-    painter.with_clip_rect(text_rect).galley(
-        pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width().max(0.0));
+    let galley = painter.layout_job(job);
+    let at = pos2(text_rect.left(), rect.center().y - galley.size().y / 2.0);
+    let shown = Rect::from_min_size(at, galley.size()).intersect(text_rect);
+    let color = link(0, shown, color);
+    painter.with_clip_rect(text_rect).galley(at, galley, color);
     if let Some(signal) = signal {
         let (on, off) = if lit {
             (pal.on_accent, pal.accent_hover)
@@ -1184,7 +1604,6 @@ pub fn web_url(text: &str) -> Option<String> {
 /// Opens with `xdg-open`, since eframe opens no links on the desktop. A
 /// failure shows below the link.
 pub fn link(ui: &mut Ui, pal: &Palette, text: egui::RichText, url: &str) {
-    let failed = Id::new(("open-url", url));
     let response = ui
         .add(egui::Label::new(text.color(pal.info)).sense(Sense::click()))
         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1196,33 +1615,43 @@ pub fn link(ui: &mut Ui, pal: &Palette, text: egui::RichText, url: &str) {
         );
     }
     if response.clicked() {
-        ui.data_mut(|d| d.remove::<String>(failed));
-        let (ctx, url) = (ui.ctx().clone(), url.to_owned());
-        std::thread::spawn(move || {
-            log::info!("opening {url}");
-            // Not run(): its LC_ALL=C would reach a browser started by this.
-            let result = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            log::debug!("xdg-open {url} -> {result:?}");
-            let err = match result {
-                Ok(status) if status.success() => return,
-                Ok(status) => format!("xdg-open failed: {status}"),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    "xdg-open is not installed".to_owned()
-                }
-                Err(err) => format!("Could not run xdg-open: {err}"),
-            };
-            let err = crate::nm::failed("URL-1", &format!("open {url}"), err);
-            ctx.data_mut(|d| d.insert_temp(failed, err));
-            ctx.request_repaint();
-        });
+        open_url(ui.ctx(), url);
     }
-    if let Some(err) = ui.data(|d| d.get_temp::<String>(failed)) {
+    if let Some(err) = url_error(ui.ctx(), url) {
         ui.label(egui::RichText::new(err).color(pal.danger).small());
     }
+}
+
+/// Runs `xdg-open` on its own thread; a failure is kept for `url_error`.
+fn open_url(ctx: &egui::Context, url: &str) {
+    let failed = Id::new(("open-url", url));
+    ctx.data_mut(|d| d.remove::<String>(failed));
+    let (ctx, url) = (ctx.clone(), url.to_owned());
+    std::thread::spawn(move || {
+        log::info!("opening {url}");
+        // Not run(): its LC_ALL=C would reach a browser started by this.
+        let result = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        log::debug!("xdg-open {url} -> {result:?}");
+        let err = match result {
+            Ok(status) if status.success() => return,
+            Ok(status) => format!("xdg-open failed: {status}"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                "xdg-open is not installed".to_owned()
+            }
+            Err(err) => format!("Could not run xdg-open: {err}"),
+        };
+        let err = crate::nm::failed("URL-1", &format!("open {url}"), err);
+        ctx.data_mut(|d| d.insert_temp(failed, err));
+        ctx.request_repaint();
+    });
+}
+
+fn url_error(ctx: &egui::Context, url: &str) -> Option<String> {
+    ctx.data(|d| d.get_temp::<String>(Id::new(("open-url", url))))
 }
 
 #[cfg(test)]
@@ -1290,6 +1719,91 @@ mod tests {
             state.popup.is_some(),
             "the popup closed the frame after it opened"
         );
+    }
+
+    fn click(at: Pos2) -> Vec<Event> {
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![Event::PointerMoved(at), button(true), button(false)]
+    }
+
+    #[test]
+    fn clicking_a_column_head_sorts_by_it_and_again_flips_the_direction() {
+        let ctx = Context::default();
+        ctx.set_fonts(fastframe_fonts::FontSetup::default().definitions());
+        let mut state = FormState::default();
+        let table = Table {
+            name: "Name",
+            columns: &[("Size", 100.0)],
+        };
+        let mut frame = |events, mut sort: Option<Sort>| {
+            let raw = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))),
+                events,
+                ..Default::default()
+            };
+            let pal = Palette::gruvbox_dark_hard();
+            let cells = ["1 kB".to_owned()];
+            let rows = [Row::Item {
+                text: "one",
+                detail: None,
+                signal: None,
+                switch: None,
+                tree: &[],
+                columns: &cells,
+                links: &[],
+            }];
+            let mut output = ctx.run_ui(raw, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut form = Form::new(&mut state, &[], &pal);
+                    form.table(ui, "list", &table, &mut sort, &rows, &mut 0);
+                    form.finish(&ui.ctx().clone());
+                });
+            });
+            output.textures_delta.clear();
+            sort
+        };
+        let (name, size) = (pos2(40.0, 22.0), pos2(340.0, 22.0));
+        let sort = |column, descending| Some(Sort { column, descending });
+
+        let sorted = frame(Vec::new(), None);
+        let sorted = frame(click(size), sorted);
+        assert_eq!(sorted, sort(1, true));
+        let sorted = frame(click(size), sorted);
+        assert_eq!(sorted, sort(1, false));
+        let sorted = frame(click(name), sorted);
+        assert_eq!(sorted, sort(0, false));
+    }
+
+    #[test]
+    fn sorting_keeps_every_row_under_its_header() {
+        let mut lines = ["b", "c", "a", "#", "z", "y"];
+        let header = |l: &&str| *l == "#";
+        let by_name = |a: &&str, b: &&str| a.cmp(b);
+        sort_groups(
+            &mut lines,
+            header,
+            Sort {
+                column: 0,
+                descending: false,
+            },
+            by_name,
+        );
+        assert_eq!(lines, ["a", "b", "c", "#", "y", "z"]);
+        sort_groups(
+            &mut lines,
+            header,
+            Sort {
+                column: 0,
+                descending: true,
+            },
+            by_name,
+        );
+        assert_eq!(lines, ["c", "b", "a", "#", "z", "y"]);
     }
 
     #[test]

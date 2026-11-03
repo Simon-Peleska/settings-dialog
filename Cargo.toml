@@ -14,7 +14,9 @@ fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
 fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
 fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
+fastframe-instance = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
 egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+libc = "0.2"
 log = "0.4"
 serde_json = "1"
 

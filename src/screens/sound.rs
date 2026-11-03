@@ -4,7 +4,7 @@ use egui::{Frame, Margin, Rect, RichText, Stroke, Ui, UiBuilder, pos2, vec2};
 
 use super::overlay::Overlay;
 use super::{Action, Cx};
-use crate::form::{self, Form, Icon, Row};
+use crate::form::{self, Form, Icon, Row, Sort, Table};
 use crate::pw::{self, Node, Request, Side, Snapshot};
 use crate::theme::Palette;
 
@@ -15,6 +15,10 @@ const LABEL: f32 = 170.0;
 const PADDING: i8 = 16;
 /// How long a volume just set wins over the snapshot, which lags behind it.
 const SETTLE: Duration = Duration::from_secs(1);
+const TABLE: Table = Table {
+    name: "Name",
+    columns: &[("Status", 130.0), ("Volume", 80.0)],
+};
 
 pub struct Sound {
     snap: Option<Result<Snapshot, String>>,
@@ -26,6 +30,8 @@ pub struct Sound {
     refreshed: Option<Instant>,
     /// The node, the volumes set and when.
     volume: Option<(u32, Vec<f32>, Instant)>,
+    /// `None` keeps the groups in alphabetical order.
+    sort: Option<Sort>,
 }
 
 struct Line {
@@ -33,7 +39,12 @@ struct Line {
     side: Option<Side>,
     id: u32,
     text: String,
-    detail: String,
+    /// Current and default count most, then current, then default.
+    rank: u8,
+    /// Muted counts as silent; nodes without a volume come last.
+    loudness: f32,
+    /// Status and volume as shown.
+    cells: [String; 2],
 }
 
 impl Sound {
@@ -44,6 +55,7 @@ impl Sound {
             selected: None,
             refreshed: None,
             volume: None,
+            sort: None,
         }
     }
 
@@ -70,16 +82,31 @@ impl Sound {
             Some(Ok(snap)) => Some(snap),
             _ => None,
         };
-        let lines = snap.map(lines).unwrap_or_default();
+        let mut lines = snap.map(lines).unwrap_or_default();
+        if let Some(sort) = self.sort {
+            form::sort_groups(
+                &mut lines,
+                |l| l.header.is_some(),
+                sort,
+                |a, b| match sort.column {
+                    0 => form::by_text(&a.text, &b.text),
+                    1 => a.rank.cmp(&b.rank),
+                    _ => a.loudness.total_cmp(&b.loudness),
+                },
+            );
+        }
         let rows: Vec<Row<'_>> = lines
             .iter()
             .map(|line| match line.header {
                 Some(header) => Row::Header(header),
                 None => Row::Item {
                     text: &line.text,
-                    detail: Some(line.detail.as_str()).filter(|d| !d.is_empty()),
+                    detail: None,
                     signal: None,
                     switch: None,
+                    tree: &[],
+                    columns: &line.cells,
+                    links: &[],
                 },
             })
             .collect();
@@ -157,14 +184,14 @@ impl Sound {
             }
             let area = ui.available_rect_before_wrap();
             let (Some(node), Some(line), Some(snap)) = (node, line, snap) else {
-                press = form.list(ui, "list", &rows, &mut selected, area.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
                 return;
             };
             let split = area.right() - PANE_WIDTH;
             let list = Rect::from_min_max(area.min, pos2(split - GAP, area.bottom()));
             let pane = Rect::from_min_max(pos2(split, area.top()), area.max);
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-                press = form.list(ui, "list", &rows, &mut selected, list.size());
+                press = form.table(ui, "list", &TABLE, &mut self.sort, &rows, &mut selected);
             });
             ui.scope_builder(UiBuilder::new().max_rect(pane), |ui| {
                 let mark = form.mark();
@@ -262,22 +289,32 @@ fn lines(snap: &Snapshot) -> Vec<Line> {
             side,
             id: 0,
             text: String::new(),
-            detail: String::new(),
+            rank: 0,
+            loudness: 0.0,
+            cells: Default::default(),
         });
         lines.extend(nodes.into_iter().map(|node| {
             let current = side.is_some_and(|side| snap.is_current(node, side));
             let default = side.is_some_and(|side| snap.is_default(node, side));
-            let marks = [
-                current.then(|| "current".to_owned()),
-                default.then(|| "default".to_owned()),
-                loudness(node),
-            ];
+            let status = match (current, default) {
+                (true, true) => "current, default",
+                (true, false) => "current",
+                (false, true) => "default",
+                (false, false) => "",
+            };
+            let level = match node.volume() {
+                Some(_) if node.muted => 0.0,
+                Some(volume) => volume,
+                None => -1.0,
+            };
             Line {
                 header: None,
                 side,
                 id: node.id,
                 text: label(node),
-                detail: marks.into_iter().flatten().collect::<Vec<_>>().join(", "),
+                rank: u8::from(current) * 2 + u8::from(default),
+                loudness: level,
+                cells: [status.to_owned(), loudness(node).unwrap_or_default()],
             }
         }));
     }
@@ -488,7 +525,7 @@ fn row(ui: &mut Ui, pal: &Palette, label: &str, value: &str) {
             egui::Layout::right_to_left(egui::Align::Min),
             |ui| ui.label(RichText::new(label).color(pal.secondary)),
         );
-        ui.label(RichText::new(value).color(pal.text));
+        ui.add(egui::Label::new(RichText::new(value).color(pal.text)).wrap());
     });
 }
 
@@ -540,26 +577,26 @@ mod tests {
             default_source: Some("Mic".to_owned()),
             ..Snapshot::default()
         };
-        let shown: Vec<(String, String)> = lines(&snap)
+        let shown: Vec<(String, [String; 2])> = lines(&snap)
             .into_iter()
-            .map(|l| (l.header.map_or(l.text, str::to_owned), l.detail))
+            .map(|l| (l.header.map_or(l.text, str::to_owned), l.cells))
             .collect();
-        let shown: Vec<(&str, &str)> = shown
+        let shown: Vec<(&str, &str, &str)> = shown
             .iter()
-            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .map(|(name, [status, volume])| (name.as_str(), status.as_str(), volume.as_str()))
             .collect();
         assert_eq!(
             shown,
             [
-                ("Outputs", ""),
-                ("Headset", "default"),
-                ("Speakers", "current"),
-                ("Inputs", ""),
-                ("Headset", ""),
-                ("Mic", "current, default"),
-                ("Streams", ""),
-                ("Bot", "muted"),
-                ("Firefox: Video", "42 %"),
+                ("Outputs", "", ""),
+                ("Headset", "default", ""),
+                ("Speakers", "current", ""),
+                ("Inputs", "", ""),
+                ("Headset", "", ""),
+                ("Mic", "current, default", ""),
+                ("Streams", "", ""),
+                ("Bot", "", "muted"),
+                ("Firefox: Video", "", "42 %"),
             ]
         );
     }
